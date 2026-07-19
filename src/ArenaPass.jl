@@ -45,7 +45,7 @@ end
 Arena() = Arena(Memory{UInt8}[], 0, 0, Memory{UInt8}[], ReentrantLock())
 
 const CHUNK_SIZE = Ref(1 << 23)        # 8 MiB uniform chunks
-const STORE_MAX_BYTES = Ref(1 << 32)   # keep ≤ 4 GiB warm in the store
+const STORE_MAX_BYTES = Ref(1 << 32)   # rescaled per-machine in __init__
 const MIN_BYTES = Ref(1024)
 
 # The store lock is taken by every chunk claim/return from every scope on
@@ -58,6 +58,7 @@ const BIG_STORE = Memory{UInt8}[]      # dedicated right-sized chunks
 const STORE_BYTES = Ref(0)
 const STORE_LOCK = ReentrantLock()
 const CHUNKS_CREATED = Threads.Atomic{Int}(0)
+const CHUNKS_TRIMMED = Threads.Atomic{Int}(0)  # dropped to GC by the store cap
 const NALLOCS = Threads.Atomic{Int}(0)
 const FALLBACKS = Threads.Atomic{Int}(0)   # kept for API compat; unused (no arena-OOM)
 
@@ -100,10 +101,14 @@ function return_chunks!(chunks::Vector{Memory{UInt8}})
             STORE_BYTES[] += length(ch)
         end
         while STORE_BYTES[] > STORE_MAX_BYTES[]
-            # trim odd sizes first (least reusable), then uniform; excess → GC
+            # trim odd sizes first (least reusable), then uniform; excess → GC.
+            # A GROWING chunks_trimmed counter means the cap is below the warm
+            # working set (concurrent scopes × per-scope peak) and arena traffic
+            # is degenerating into GC traffic — raise STORE_MAX_BYTES.
             src = isempty(BIG_STORE) ? CHUNK_STORE : BIG_STORE
             isempty(src) && break
             STORE_BYTES[] -= length(pop!(src))
+            Threads.atomic_add!(CHUNKS_TRIMMED, 1)
         end
     end
     empty!(chunks)
@@ -197,9 +202,10 @@ end
 function arena_stats()
     store_bytes = lock(() -> STORE_BYTES[], STORE_LOCK)
     return (nallocs=NALLOCS[], fallbacks=FALLBACKS[],
-            chunks_created=CHUNKS_CREATED[], store_bytes=store_bytes)
+            chunks_created=CHUNKS_CREATED[], chunks_trimmed=CHUNKS_TRIMMED[],
+            store_bytes=store_bytes)
 end
-reset_arena_stats!() = (NALLOCS[] = 0; FALLBACKS[] = 0; nothing)
+reset_arena_stats!() = (NALLOCS[] = 0; FALLBACKS[] = 0; CHUNKS_TRIMMED[] = 0; nothing)
 
 # ---------------- the scoped method swap ----------------
 Base.Experimental.@MethodTable ARENA_TABLE
@@ -554,8 +560,13 @@ function __init__()
     # still found through the runtime's own cache when valid)
     foreach(empty!, CI_DICTS)
     empty!(CHUNK_STORE); empty!(BIG_STORE); STORE_BYTES[] = 0
-    NALLOCS[] = 0; FALLBACKS[] = 0; CHUNKS_CREATED[] = 0
+    NALLOCS[] = 0; FALLBACKS[] = 0; CHUNKS_CREATED[] = 0; CHUNKS_TRIMMED[] = 0
     DISPATCH_HITS[] = 0; DISPATCH_FALLBACKS[] = 0; TASK_REWRITES[] = 0
+    # The warm working set is (concurrent scopes) × (per-scope peak): a fixed
+    # cap starves high-thread machines into chunk churn, where every scope
+    # exit trims chunks to the GC and every entry allocates fresh ones —
+    # arena traffic becomes GC traffic (watch arena_stats().chunks_trimmed).
+    STORE_MAX_BYTES[] = max(1 << 32, Threads.nthreads() << 29)  # ≥4 GiB, 512 MiB/thread
     return nothing
 end
 

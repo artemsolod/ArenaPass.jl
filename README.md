@@ -146,7 +146,14 @@ before the first `@arena` call.
 | `ArenaPass.SPAWN[]` | `true` | rewrite task creation to be arena-aware |
 | `ArenaPass.MIN_BYTES[]` | `1024` | smaller allocations use the GC |
 | `ArenaPass.CHUNK_SIZE[]` | `8 MiB` | uniform chunk size |
-| `ArenaPass.STORE_MAX_BYTES[]` | `4 GiB` | warm-store cap; excess chunks go to GC |
+| `ArenaPass.STORE_MAX_BYTES[]` | `max(4 GiB, 512 MiB × nthreads)` | warm-store cap; excess chunks go to GC |
+
+**Sizing the store**: the warm working set is (concurrent scopes) ×
+(per-scope peak allocation). If the cap is below it, chunks are trimmed to
+the GC at every scope exit and freshly allocated at every entry — arena
+traffic silently degenerates into GC traffic. `arena_stats().chunks_trimmed`
+growing across steady-state runs is the tell; raise `STORE_MAX_BYTES[]`
+until it stops.
 
 ## License
 
