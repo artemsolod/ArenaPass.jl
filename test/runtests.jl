@@ -121,4 +121,17 @@ reset_arena_stats!()
 @assert arena_stats().nallocs == 0
 println("@noarena spawn escape hatch: OK")
 
+# --- 10. deep-mode dispatch with Type-valued arguments: distinct type values
+#          at one dynamic site must get distinct CodeInstances (regression:
+#          typeof-based cache keys collapsed all Types to DataType, and the
+#          second type value died in invoke with a signature TypeError)
+@noinline typearg_callee(::Type{T}, s::Symbol) where {T} = (zeros(2000); T)
+typearg_caller(T) = Base.inferencebarrier(typearg_callee)(T, :x)
+@assert (@arena typearg_caller(String)) === String
+@assert (@arena typearg_caller(Int)) === Int          # was: TypeError in invoke
+mkvec(T, n) = Base.inferencebarrier(T)(undef, n)      # ctor in f-position
+@assert length(@arena mkvec(Vector{Float64}, 7)) == 7
+@assert length(@arena mkvec(Vector{Int32}, 8)) == 8   # same erasure class
+println("Type-valued args at dynamic sites: OK")
+
 println("\nall ArenaPass tests passed")

@@ -409,9 +409,15 @@ const CI_CACHE = Dict{Any,CodeInstance}()
 const CI_LOCK = ReentrantLock()
 
 function arena_codeinstance(@nospecialize(f), @nospecialize(args::Tuple))
-    key = Any[typeof(f)]
+    # Core.Typeof, NOT typeof: for a type-valued argument typeof collapses to
+    # DataType, so e.g. f(String) and f(Int) would share a cache key while the
+    # cached CodeInstance is specialized for whichever type value came first —
+    # the later call then dies in `invoke` with a signature TypeError.
+    # Core.Typeof(String) == Type{String} keeps the keys apart (and matches
+    # how jl_method_lookup specializes on the actual values).
+    key = Any[Core.Typeof(f)]
     for a in args
-        push!(key, typeof(a))
+        push!(key, Core.Typeof(a))
     end
     sig = Tuple{key...}
     world = Base.tls_world_age()
