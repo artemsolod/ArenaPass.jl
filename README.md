@@ -147,6 +147,7 @@ before the first `@arena` call.
 | `ArenaPass.MIN_BYTES[]` | `1024` | smaller allocations use the GC |
 | `ArenaPass.CHUNK_SIZE[]` | `8 MiB` | uniform chunk size |
 | `ArenaPass.STORE_MAX_BYTES[]` | `max(4 GiB, 512 MiB × nthreads)` | warm-store cap; excess chunks go to GC |
+| `ArenaPass.HUGEPAGES[]` | `true` on Linux | back chunks with anonymous mmap + `madvise(MADV_HUGEPAGE)` (2 MiB-aligned; what [julia#59858](https://github.com/JuliaLang/julia/pull/59858) does for large GC allocations from 1.13) |
 
 **Sizing the store**: the warm working set is (concurrent scopes) ×
 (per-scope peak allocation). If the cap is below it, chunks are trimmed to

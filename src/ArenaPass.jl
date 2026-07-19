@@ -46,6 +46,40 @@ Arena() = Arena(Memory{UInt8}[], 0, 0, Memory{UInt8}[], ReentrantLock())
 
 const CHUNK_SIZE = Ref(1 << 23)        # 8 MiB uniform chunks
 const STORE_MAX_BYTES = Ref(1 << 32)   # rescaled per-machine in __init__
+
+# Explicit transparent-hugepage backing for chunks (julia#59858 does this for
+# large GC allocations, but only from 1.13). Chunks are ideal THP targets:
+# large, uniform, long-lived, sequentially bumped. We go one step further
+# than madvising a malloc'd buffer: chunks come from anonymous mmap (page
+# aligned by construction, length rounded to the 2 MiB hugepage boundary),
+# then MADV_HUGEPAGE. The region is wrapped back into Memory{UInt8} with a
+# munmap finalizer, so the store/trim/GC lifecycle is unchanged.
+const HUGEPAGES = Ref(false)           # default Sys.islinux(), set in __init__
+const HUGEPAGE_SIZE = 1 << 21          # 2 MiB
+const MADV_HUGEPAGE = Cint(14)         # linux uapi
+# PROT_READ|PROT_WRITE; MAP_PRIVATE|MAP_ANONYMOUS (0x1000 = MAP_ANON on mac,
+# where the mmap path still works for testing — madvise is Linux-only)
+const MMAP_PROT = Cint(0x3)
+const MMAP_FLAGS = Cint(Sys.islinux() ? 0x22 : 0x1002)
+
+function alloc_chunk(len::Int)::Memory{UInt8}
+    if HUGEPAGES[]
+        len = (len + HUGEPAGE_SIZE - 1) & ~(HUGEPAGE_SIZE - 1)
+        ptr = @ccall mmap(C_NULL::Ptr{Cvoid}, len::Csize_t, MMAP_PROT::Cint,
+                          MMAP_FLAGS::Cint, (-1)::Cint, 0::Int64)::Ptr{Cvoid}
+        if ptr != Ptr{Cvoid}(-1)
+            Sys.islinux() &&
+                @ccall madvise(ptr::Ptr{Cvoid}, len::Csize_t, MADV_HUGEPAGE::Cint)::Cint
+            m = unsafe_wrap(Memory{UInt8}, Ptr{UInt8}(ptr), len; own=false)
+            finalizer(m) do mm
+                @ccall munmap(pointer(mm)::Ptr{Cvoid}, length(mm)::Csize_t)::Cint
+            end
+            return m
+        end
+        # mmap failure (address-space/commit limits): fall through to the GC
+    end
+    return Memory{UInt8}(undef, len)
+end
 const MIN_BYTES = Ref(1024)
 
 # The store lock is taken by every chunk claim/return from every scope on
@@ -89,7 +123,7 @@ function take_chunk!(minsz::Int)::Memory{UInt8}
     end
     c isa Memory{UInt8} && return c
     Threads.atomic_add!(CHUNKS_CREATED, 1)
-    return Memory{UInt8}(undef, max(minsz, csz))
+    return alloc_chunk(max(minsz, csz))
 end
 
 function return_chunks!(chunks::Vector{Memory{UInt8}})
@@ -567,6 +601,7 @@ function __init__()
     # exit trims chunks to the GC and every entry allocates fresh ones —
     # arena traffic becomes GC traffic (watch arena_stats().chunks_trimmed).
     STORE_MAX_BYTES[] = max(1 << 32, Threads.nthreads() << 29)  # ≥4 GiB, 512 MiB/thread
+    HUGEPAGES[] = Sys.islinux()   # THP madvise is a no-op elsewhere
     return nothing
 end
 

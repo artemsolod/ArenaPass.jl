@@ -134,4 +134,24 @@ mkvec(T, n) = Base.inferencebarrier(T)(undef, n)      # ctor in f-position
 @assert length(@arena mkvec(Vector{Int32}, 8)) == 8   # same erasure class
 println("Type-valued args at dynamic sites: OK")
 
+# --- 11. hugepage-backed chunks: mmap-path lifecycle (alloc, warm reuse,
+#          munmap finalizer). madvise(MADV_HUGEPAGE) only applies on Linux;
+#          the mmap machinery itself is exercised on every platform.
+old_cap = ArenaPass.STORE_MAX_BYTES[]
+ArenaPass.STORE_MAX_BYTES[] = 0          # drain: scope exits drop all chunks
+@arena outer(1_000_000)
+ArenaPass.STORE_MAX_BYTES[] = old_cap
+old_hp = ArenaPass.HUGEPAGES[]
+ArenaPass.HUGEPAGES[] = true
+c0 = arena_stats().chunks_created
+@assert (@arena outer(1_000_000)) == outer(1_000_000)   # fresh mmap'd chunk
+@assert arena_stats().chunks_created > c0
+GC.gc(); GC.gc()                         # run munmap finalizers of dropped chunks
+@assert (@arena outer(1_000_000)) == outer(1_000_000)   # warm mmap chunk reused
+c1 = arena_stats().chunks_created
+@assert (@arena outer(1_000_000)) == outer(1_000_000)
+@assert arena_stats().chunks_created == c1
+ArenaPass.HUGEPAGES[] = old_hp
+println("hugepage chunk path: OK (mmap alloc, reuse, finalizer)")
+
 println("\nall ArenaPass tests passed")
