@@ -48,40 +48,62 @@ const CHUNK_SIZE = Ref(1 << 23)        # 8 MiB uniform chunks
 const STORE_MAX_BYTES = Ref(1 << 32)   # keep ≤ 4 GiB warm in the store
 const MIN_BYTES = Ref(1024)
 
-const CHUNK_STORE = Memory{UInt8}[]
+# The store lock is taken by every chunk claim/return from every scope on
+# every thread — keep the critical sections O(1). Uniform chunks (the common
+# case by far) live in a LIFO freelist; dedicated odd-size chunks are few and
+# get a best-fit scan of their own short list. STORE_BYTES is the running
+# total (guarded by STORE_LOCK), so returns don't rescan the store.
+const CHUNK_STORE = Memory{UInt8}[]    # uniform CHUNK_SIZE chunks, LIFO
+const BIG_STORE = Memory{UInt8}[]      # dedicated right-sized chunks
+const STORE_BYTES = Ref(0)
 const STORE_LOCK = ReentrantLock()
 const CHUNKS_CREATED = Threads.Atomic{Int}(0)
 const NALLOCS = Threads.Atomic{Int}(0)
 const FALLBACKS = Threads.Atomic{Int}(0)   # kept for API compat; unused (no arena-OOM)
 
-"Take the smallest stored chunk with length ≥ minsz, or allocate a fresh one."
+"Take a stored chunk with length ≥ minsz, or allocate a fresh one."
 function take_chunk!(minsz::Int)::Memory{UInt8}
+    csz = CHUNK_SIZE[]
     c = lock(STORE_LOCK) do
-        best, bestlen = 0, typemax(Int)
-        for (i, ch) in enumerate(CHUNK_STORE)
-            l = length(ch)
-            if minsz <= l < bestlen
-                best, bestlen = i, l
+        if minsz <= csz
+            # O(1) pop; skip (drop to GC) stale chunks from an old CHUNK_SIZE
+            while !isempty(CHUNK_STORE)
+                ch = pop!(CHUNK_STORE)
+                STORE_BYTES[] -= length(ch)
+                length(ch) >= minsz && return ch
             end
+            nothing
+        else
+            best, bestlen = 0, typemax(Int)
+            for (i, ch) in enumerate(BIG_STORE)
+                l = length(ch)
+                if minsz <= l < bestlen
+                    best, bestlen = i, l
+                end
+            end
+            best == 0 ? nothing :
+                (ch = BIG_STORE[best]; deleteat!(BIG_STORE, best);
+                 STORE_BYTES[] -= length(ch); ch)
         end
-        best == 0 ? nothing :
-            (ch = CHUNK_STORE[best]; deleteat!(CHUNK_STORE, best); ch)
     end
     c isa Memory{UInt8} && return c
     Threads.atomic_add!(CHUNKS_CREATED, 1)
-    return Memory{UInt8}(undef, max(minsz, CHUNK_SIZE[]))
+    return Memory{UInt8}(undef, max(minsz, csz))
 end
 
 function return_chunks!(chunks::Vector{Memory{UInt8}})
     isempty(chunks) && return nothing
+    csz = CHUNK_SIZE[]
     lock(STORE_LOCK) do
-        append!(CHUNK_STORE, chunks)
-        total = 0
-        for ch in CHUNK_STORE
-            total += length(ch)
+        for ch in chunks
+            push!(length(ch) == csz ? CHUNK_STORE : BIG_STORE, ch)
+            STORE_BYTES[] += length(ch)
         end
-        while total > STORE_MAX_BYTES[] && !isempty(CHUNK_STORE)
-            total -= length(pop!(CHUNK_STORE))  # excess goes to GC
+        while STORE_BYTES[] > STORE_MAX_BYTES[]
+            # trim odd sizes first (least reusable), then uniform; excess → GC
+            src = isempty(BIG_STORE) ? CHUNK_STORE : BIG_STORE
+            isempty(src) && break
+            STORE_BYTES[] -= length(pop!(src))
         end
     end
     empty!(chunks)
@@ -173,13 +195,7 @@ const NOARENA = ScopedValue(false)
 end
 
 function arena_stats()
-    store_bytes = lock(STORE_LOCK) do
-        s = 0
-        for ch in CHUNK_STORE
-            s += length(ch)
-        end
-        s
-    end
+    store_bytes = lock(() -> STORE_BYTES[], STORE_LOCK)
     return (nallocs=NALLOCS[], fallbacks=FALLBACKS[],
             chunks_created=CHUNKS_CREATED[], store_bytes=store_bytes)
 end
@@ -405,24 +421,31 @@ end
 @noinline arena_Task(@nospecialize(f), ssize::Int) = Task(wrap_task_start(f), ssize)
 
 # ---------------- entry: ArenaPirate-like interface ----------------
-const CI_CACHE = Dict{Any,CodeInstance}()
-const CI_LOCK = ReentrantLock()
+# The CI cache sits on the hot path of every deep-mode dispatch and is hit
+# from every thread; one global lock here serialized both cache hits AND
+# in-world inference across threads (measured: >500k lock conflicts in a real
+# MT DataFrames workload). Shard it: conflicts only occur within a shard, and
+# inference for different call graphs proceeds in parallel while same-sig
+# compilation is still deduplicated (per shard).
+const CI_NSHARDS = 64
+const CI_LOCKS = [ReentrantLock() for _ in 1:CI_NSHARDS]
+const CI_DICTS = [Dict{Any,CodeInstance}() for _ in 1:CI_NSHARDS]
 
 function arena_codeinstance(@nospecialize(f), @nospecialize(args::Tuple))
-    # Core.Typeof, NOT typeof: for a type-valued argument typeof collapses to
-    # DataType, so e.g. f(String) and f(Int) would share a cache key while the
-    # cached CodeInstance is specialized for whichever type value came first —
-    # the later call then dies in `invoke` with a signature TypeError.
-    # Core.Typeof(String) == Type{String} keeps the keys apart (and matches
-    # how jl_method_lookup specializes on the actual values).
-    key = Any[Core.Typeof(f)]
-    for a in args
-        push!(key, Core.Typeof(a))
-    end
-    sig = Tuple{key...}
+    # Base.typesof builds Tuple{Core.Typeof(f), Core.Typeof.(args)...} in one
+    # step; repeated calls intern to the SAME type object (cache-hit in the
+    # runtime's type cache, precomputed hash field), so it is both the cheapest
+    # key to build and the cheapest to hash/compare. Core.Typeof semantics
+    # matter: plain typeof collapses every type-valued argument to DataType,
+    # so e.g. f(String) and f(Int) would share a cache key while the cached
+    # CodeInstance is specialized for whichever type value came first — the
+    # later call then dies in `invoke` with a signature TypeError.
+    key = Base.typesof(f, args...)
     world = Base.tls_world_age()
-    lock(CI_LOCK) do
-        ci = get(CI_CACHE, sig, nothing)
+    s = Int(objectid(key) % UInt(CI_NSHARDS)) + 1  # interned → objectid is stable
+    d = CI_DICTS[s]
+    lock(CI_LOCKS[s]) do
+        ci = get(d, key, nothing)
         if ci isa CodeInstance && ci.min_world <= world <= ci.max_world
             return ci
         end
@@ -432,7 +455,7 @@ function arena_codeinstance(@nospecialize(f), @nospecialize(args::Tuple))
         mi = unsafe_pointer_to_objref(miptr)::Core.MethodInstance
         ci = typeinf(ArenaCacheOwner(), mi, Compiler.SOURCE_MODE_ABI)
         ci isa CodeInstance || return nothing
-        CI_CACHE[sig] = ci
+        d[key] = ci
         return ci
     end
 end
@@ -529,8 +552,8 @@ function __init__()
     # entries created during precompile carry that session's world ranges and
     # state — start every session clean (pkgimage-cached CodeInstances are
     # still found through the runtime's own cache when valid)
-    empty!(CI_CACHE)
-    empty!(CHUNK_STORE)
+    foreach(empty!, CI_DICTS)
+    empty!(CHUNK_STORE); empty!(BIG_STORE); STORE_BYTES[] = 0
     NALLOCS[] = 0; FALLBACKS[] = 0; CHUNKS_CREATED[] = 0
     DISPATCH_HITS[] = 0; DISPATCH_FALLBACKS[] = 0; TASK_REWRITES[] = 0
     return nothing
@@ -547,8 +570,8 @@ using PrecompileTools: @setup_workload, @compile_workload
         @arena _pc_sortslice(rand(100))
         @arena sum(collect(1:50))
     end
-    empty!(CHUNK_STORE)  # never serialize chunk buffers into the pkgimage
-    empty!(CI_CACHE)
+    empty!(CHUNK_STORE); empty!(BIG_STORE); STORE_BYTES[] = 0  # never serialize chunk buffers into the pkgimage
+    foreach(empty!, CI_DICTS)
 end
 
 end # module
