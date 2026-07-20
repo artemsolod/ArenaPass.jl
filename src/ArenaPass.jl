@@ -59,12 +59,20 @@ const HUGEPAGE_SIZE = 1 << 21          # 2 MiB
 const MADV_HUGEPAGE = Cint(14)         # linux uapi
 
 # mmap'd chunks are INVISIBLE to Julia's GC accounting (own=false wrap): the
-# GC feels no pressure from them, so dropped chunks can pile up un-finalized
-# (munmap only happens in a finalizer, finalizers only run at collections)
-# and RSS grows until the OS OOM-kills the process. Track bytes dropped but
-# not yet munmapped, and force a collection before mapping fresh memory when
-# too much is pending.
-const PENDING_MUNMAP = Threads.Atomic{Int}(0)
+# GC feels no pressure from them, so nothing ever pushes back on mapped
+# memory. This is not just an OOM-kill risk — exhausted address space/commit
+# makes libunwind's own pool-expansion mmap fail, and its no-bounds-check
+# emergency allocator then SIGSEGVs (observed: two identical core dumps from
+# a 90-thread production run). Three defenses, layered:
+#   1. drop_chunk! munmaps EAGERLY via finalize() — the store cap bounds real
+#      resident memory, not just wrapper counts;
+#   2. MMAP_LIVE tracks every mapped chunk byte; at the MMAP_MAX_BYTES ceiling
+#      one GC reclaims any stragglers dropped through non-eager paths, and if
+#      still over, fresh chunks fall back to GC allocation, which the
+#      collector CAN feel and push back on.
+const MMAP_LIVE = Threads.Atomic{Int}(0)
+const MMAP_MAX_BYTES = Ref(typemax(Int))   # set to RAM/2 in __init__
+const MMAP_GC_ARMED = Threads.Atomic{Int}(1)
 # PROT_READ|PROT_WRITE; MAP_PRIVATE|MAP_ANONYMOUS (0x1000 = MAP_ANON on mac,
 # where the mmap path still works for testing — madvise is Linux-only)
 const MMAP_PROT = Cint(0x3)
@@ -72,35 +80,43 @@ const MMAP_FLAGS = Cint(Sys.islinux() ? 0x22 : 0x1002)
 
 function alloc_chunk(len::Int)::Memory{UInt8}
     if HUGEPAGES[]
-        # safety valve: with > max(cap/4, 1 GiB) dropped-but-unmapped, run the
-        # finalizers before mapping more — otherwise nothing ever pushes back
-        if PENDING_MUNMAP[] > max(STORE_MAX_BYTES[] >> 2, 1 << 30)
-            GC.gc()
+        hlen = (len + HUGEPAGE_SIZE - 1) & ~(HUGEPAGE_SIZE - 1)
+        if MMAP_LIVE[] + hlen > MMAP_MAX_BYTES[]
+            # one shot at reclaiming mappings dropped through non-eager paths
+            # (armed flag: no GC storm when the working set is legitimately
+            # at the ceiling — re-arms only after dipping back under)
+            Threads.atomic_xchg!(MMAP_GC_ARMED, 0) == 1 && GC.gc()
+        else
+            MMAP_GC_ARMED[] = 1
         end
-        len = (len + HUGEPAGE_SIZE - 1) & ~(HUGEPAGE_SIZE - 1)
-        ptr = @ccall mmap(C_NULL::Ptr{Cvoid}, len::Csize_t, MMAP_PROT::Cint,
-                          MMAP_FLAGS::Cint, (-1)::Cint, 0::Int64)::Ptr{Cvoid}
-        if ptr != Ptr{Cvoid}(-1)
-            Sys.islinux() &&
-                @ccall madvise(ptr::Ptr{Cvoid}, len::Csize_t, MADV_HUGEPAGE::Cint)::Cint
-            m = unsafe_wrap(Memory{UInt8}, Ptr{UInt8}(ptr), len; own=false)
-            finalizer(m) do mm
-                Threads.atomic_sub!(PENDING_MUNMAP, length(mm))
-                @ccall munmap(pointer(mm)::Ptr{Cvoid}, length(mm)::Csize_t)::Cint
+        if MMAP_LIVE[] + hlen <= MMAP_MAX_BYTES[]
+            ptr = @ccall mmap(C_NULL::Ptr{Cvoid}, hlen::Csize_t, MMAP_PROT::Cint,
+                              MMAP_FLAGS::Cint, (-1)::Cint, 0::Int64)::Ptr{Cvoid}
+            if ptr != Ptr{Cvoid}(-1)
+                Sys.islinux() &&
+                    @ccall madvise(ptr::Ptr{Cvoid}, hlen::Csize_t, MADV_HUGEPAGE::Cint)::Cint
+                Threads.atomic_add!(MMAP_LIVE, hlen)
+                m = unsafe_wrap(Memory{UInt8}, Ptr{UInt8}(ptr), hlen; own=false)
+                finalizer(m) do mm
+                    Threads.atomic_sub!(MMAP_LIVE, length(mm))
+                    @ccall munmap(pointer(mm)::Ptr{Cvoid}, length(mm)::Csize_t)::Cint
+                end
+                return m
             end
-            return m
         end
-        # mmap failure (address-space/commit limits): fall through to the GC
+        # over the mmap ceiling, or mmap failed: use GC allocation, which the
+        # collector accounts for and pushes back on
     end
     return Memory{UInt8}(undef, len)
 end
 
-# Call at every site that DROPS a chunk (trim, stale-drop): from that moment
-# only its finalizer references the mapping. Approximation: when HUGEPAGES is
-# off (or for pre-toggle GC-backed chunks) the finalizer never decrements, so
-# the counter can only overcount — worst case a spurious GC, never an OOM.
-note_dropped_chunk(ch::Memory{UInt8}) =
-    (HUGEPAGES[] && Threads.atomic_add!(PENDING_MUNMAP, length(ch)); nothing)
+# Call at every site that DROPS a chunk (trim, stale-drop). mmap-backed chunks
+# are unmapped EAGERLY — finalize() runs the munmap finalizer synchronously
+# (it takes no locks), so resident memory tracks the store cap instead of
+# waiting for a GC that feels no pressure from unaccounted mappings. Exactly
+# as safe as reuse: a dropped chunk is unreachable by contract. For GC-backed
+# chunks finalize is a no-op.
+drop_chunk!(ch::Memory{UInt8}) = (finalize(ch); nothing)
 const MIN_BYTES = Ref(1024)
 
 # The store lock is taken by every chunk claim/return from every scope on
@@ -127,7 +143,7 @@ function take_chunk!(minsz::Int)::Memory{UInt8}
                 ch = pop!(CHUNK_STORE)
                 STORE_BYTES[] -= length(ch)
                 length(ch) >= minsz && return ch
-                note_dropped_chunk(ch)
+                drop_chunk!(ch)
             end
             nothing
         else
@@ -165,7 +181,7 @@ function return_chunks!(chunks::Vector{Memory{UInt8}})
             isempty(src) && break
             ch = pop!(src)
             STORE_BYTES[] -= length(ch)
-            note_dropped_chunk(ch)
+            drop_chunk!(ch)
             Threads.atomic_add!(CHUNKS_TRIMMED, 1)
         end
     end
@@ -265,7 +281,7 @@ function arena_stats()
     store_bytes = lock(() -> STORE_BYTES[], STORE_LOCK)
     return (nallocs=NALLOCS[], fallbacks=FALLBACKS[],
             chunks_created=CHUNKS_CREATED[], chunks_trimmed=CHUNKS_TRIMMED[],
-            store_bytes=store_bytes, pending_munmap=PENDING_MUNMAP[])
+            store_bytes=store_bytes, mmap_live=MMAP_LIVE[])
 end
 reset_arena_stats!() = (NALLOCS[] = 0; FALLBACKS[] = 0; CHUNKS_TRIMMED[] = 0; nothing)
 
@@ -672,7 +688,8 @@ function __init__()
     STORE_MAX_BYTES[] = min(max(1 << 32, Threads.nthreads() << 29),
                             Int(Sys.total_memory() >> 2))
     HUGEPAGES[] = Sys.islinux()   # THP madvise is a no-op elsewhere
-    PENDING_MUNMAP[] = 0
+    MMAP_MAX_BYTES[] = Int(Sys.total_memory() >> 1)   # mmap ceiling: half of RAM
+    MMAP_GC_ARMED[] = 1
     return nothing
 end
 

@@ -151,16 +151,22 @@ GC.gc(); GC.gc()                         # run munmap finalizers of dropped chun
 c1 = arena_stats().chunks_created
 @assert (@arena outer(1_000_000)) == outer(1_000_000)
 @assert arena_stats().chunks_created == c1
-# dropped mmap chunks are tracked and reclaimed (OOM safety valve accounting)
+# dropped mmap chunks are unmapped EAGERLY — resident memory must track the
+# store cap without waiting for GC (OOM / libunwind-exhaustion defense)
+@assert ArenaPass.MMAP_LIVE[] > 0        # warm mmap chunks are accounted
 ArenaPass.STORE_MAX_BYTES[] = 0          # every scope exit drops its chunks
 @arena outer(1_000_000)
-p0 = ArenaPass.PENDING_MUNMAP[]
-@assert p0 > 0                           # drop was counted as pending munmap
-GC.gc(); GC.gc()
-@assert ArenaPass.PENDING_MUNMAP[] < p0  # finalizers ran and unmapped
+@assert ArenaPass.MMAP_LIVE[] == 0       # everything unmapped, no GC needed
 ArenaPass.STORE_MAX_BYTES[] = old_cap
+
+# over the mmap ceiling, chunk allocation falls back to GC-backed memory
+old_ceiling = ArenaPass.MMAP_MAX_BYTES[]
+ArenaPass.MMAP_MAX_BYTES[] = 0
+@assert (@arena outer(1_000_000)) == outer(1_000_000)
+@assert ArenaPass.MMAP_LIVE[] == 0       # nothing was mmap'd under the ceiling
+ArenaPass.MMAP_MAX_BYTES[] = old_ceiling
 ArenaPass.HUGEPAGES[] = old_hp
-println("hugepage chunk path: OK (mmap alloc, reuse, finalizer, pending accounting)")
+println("hugepage chunk path: OK (mmap alloc, reuse, eager unmap, ceiling fallback)")
 
 # bump! overflow: a near-typemax size must error like native, not OOB-write
 @assert begin
