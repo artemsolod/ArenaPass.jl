@@ -575,13 +575,31 @@ function lookup_ci(s::Int, @nospecialize(key), world::UInt)
     return nothing
 end
 
+# In-world inference + eager codegen recurse DEEPLY on huge unseen graphs
+# (native execution never notices — its caches are prebuilt). Run on the
+# calling task's stack, a default-sized @spawn task overflows the C stack,
+# and a genuine stack overflow can surface as SIGSEGV inside libunwind while
+# unwinding the exhausted stack (julia#17109) — matching four production
+# cores (identical libunwind fault, rsp == rbp, unreadable caller). So every
+# compile runs on a dedicated Task with a large reserved stack (lazily
+# committed — the reserve costs address space, not RSS).
+const COMPILE_STACK = Ref(1 << 28)   # 256 MiB reserved for compile tasks
+
+function typeinf_big_stack(mi::Core.MethodInstance)
+    t = Task(() -> typeinf(ArenaCacheOwner(), mi, Compiler.SOURCE_MODE_ABI),
+             COMPILE_STACK[])
+    t.sticky = false
+    schedule(t)
+    return fetch(t)   # failures propagate as TaskFailedException
+end
+
 function compile_ci(s::Int, @nospecialize(key), @nospecialize(f),
                     @nospecialize(args::Tuple), world::UInt)
     miptr = @ccall jl_method_lookup(Any[f, args...]::Ptr{Any}, (1 + length(args))::Csize_t,
                                     world::Csize_t)::Ptr{Cvoid}
     miptr == C_NULL && return nothing
     mi = unsafe_pointer_to_objref(miptr)::Core.MethodInstance
-    ci = typeinf(ArenaCacheOwner(), mi, Compiler.SOURCE_MODE_ABI)
+    ci = typeinf_big_stack(mi)
     ci isa CodeInstance || return nothing
     d = CI_DICTS[s]
     lock(() -> (d[key] = ci), CI_LOCKS[s])
