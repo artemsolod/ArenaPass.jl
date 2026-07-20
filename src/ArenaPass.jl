@@ -73,13 +73,25 @@ const MADV_HUGEPAGE = Cint(14)         # linux uapi
 const MMAP_LIVE = Threads.Atomic{Int}(0)
 const MMAP_MAX_BYTES = Ref(typemax(Int))   # set to RAM/2 in __init__
 const MMAP_GC_ARMED = Threads.Atomic{Int}(1)
+
+# QUARANTINE: debug mode for hunting scope-contract violations. Instead of
+# returning chunks to the store at scope exit (reuse = silent corruption;
+# eager munmap = a delayed fault in the unwinder's shadow), every released
+# chunk is mprotect'ed PROT_NONE and leaked (pages dropped via MADV_DONTNEED,
+# so RSS stays flat; only address space is consumed). Any use of an escaped
+# arena array then faults DETERMINISTICALLY at the guilty access with a clean
+# stack — the backtrace names the code holding the escaped reference.
+# Set BEFORE the first @arena (forces all chunks onto the mmap path).
+const QUARANTINE = Ref(false)
+const QUARANTINED = Memory{UInt8}[]        # keeps wrappers alive: never munmap
+const MADV_DONTNEED = Cint(4)              # same value on linux and mac
 # PROT_READ|PROT_WRITE; MAP_PRIVATE|MAP_ANONYMOUS (0x1000 = MAP_ANON on mac,
 # where the mmap path still works for testing — madvise is Linux-only)
 const MMAP_PROT = Cint(0x3)
 const MMAP_FLAGS = Cint(Sys.islinux() ? 0x22 : 0x1002)
 
 function alloc_chunk(len::Int)::Memory{UInt8}
-    if HUGEPAGES[]
+    if HUGEPAGES[] || QUARANTINE[]
         hlen = (len + HUGEPAGE_SIZE - 1) & ~(HUGEPAGE_SIZE - 1)
         if MMAP_LIVE[] + hlen > MMAP_MAX_BYTES[]
             # one shot at reclaiming mappings dropped through non-eager paths
@@ -89,7 +101,10 @@ function alloc_chunk(len::Int)::Memory{UInt8}
         else
             MMAP_GC_ARMED[] = 1
         end
-        if MMAP_LIVE[] + hlen <= MMAP_MAX_BYTES[]
+        # quarantine bypasses the ceiling: mappings are deliberately leaked
+        # (RSS stays flat via MADV_DONTNEED) and a GC-backed fallback chunk
+        # could not be mprotect'ed
+        if QUARANTINE[] || MMAP_LIVE[] + hlen <= MMAP_MAX_BYTES[]
             ptr = @ccall mmap(C_NULL::Ptr{Cvoid}, hlen::Csize_t, MMAP_PROT::Cint,
                               MMAP_FLAGS::Cint, (-1)::Cint, 0::Int64)::Ptr{Cvoid}
             if ptr != Ptr{Cvoid}(-1)
@@ -166,6 +181,20 @@ end
 
 function return_chunks!(chunks::Vector{Memory{UInt8}})
     isempty(chunks) && return nothing
+    if QUARANTINE[]
+        lock(STORE_LOCK) do
+            for ch in chunks
+                # drop the pages (RSS), then seal the range: any later touch
+                # of an escaped array faults at the guilty instruction
+                @ccall madvise(pointer(ch)::Ptr{Cvoid}, length(ch)::Csize_t,
+                               MADV_DONTNEED::Cint)::Cint
+                @ccall mprotect(pointer(ch)::Ptr{Cvoid}, length(ch)::Csize_t, 0::Cint)::Cint
+                push!(QUARANTINED, ch)
+            end
+        end
+        empty!(chunks)
+        return nothing
+    end
     csz = CHUNK_SIZE[]
     lock(STORE_LOCK) do
         for ch in chunks
@@ -279,9 +308,11 @@ end
 
 function arena_stats()
     store_bytes = lock(() -> STORE_BYTES[], STORE_LOCK)
+    nquarantined = lock(() -> length(QUARANTINED), STORE_LOCK)
     return (nallocs=NALLOCS[], fallbacks=FALLBACKS[],
             chunks_created=CHUNKS_CREATED[], chunks_trimmed=CHUNKS_TRIMMED[],
-            store_bytes=store_bytes, mmap_live=MMAP_LIVE[])
+            store_bytes=store_bytes, mmap_live=MMAP_LIVE[],
+            quarantined=nquarantined)
 end
 reset_arena_stats!() = (NALLOCS[] = 0; FALLBACKS[] = 0; CHUNKS_TRIMMED[] = 0; nothing)
 
@@ -690,6 +721,7 @@ function __init__()
     HUGEPAGES[] = Sys.islinux()   # THP madvise is a no-op elsewhere
     MMAP_MAX_BYTES[] = Int(Sys.total_memory() >> 1)   # mmap ceiling: half of RAM
     MMAP_GC_ARMED[] = 1
+    QUARANTINE[] = false; empty!(QUARANTINED)
     return nothing
 end
 

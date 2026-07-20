@@ -151,6 +151,15 @@ before the first `@arena` call.
 | `ArenaPass.MMAP_MAX_BYTES[]` | RAM/2 | ceiling on total mmap'd chunk bytes (`arena_stats().mmap_live`); above it chunks fall back to GC allocation |
 | `ArenaPass.SERIAL_COMPILE[]` | `true` | serialize in-world compilation (cache hits stay concurrent) |
 
+**Hunting contract violations**: set `ArenaPass.QUARANTINE[] = true` (before
+the first `@arena`) and rerun the suspect workload. Released chunks are then
+mprotect'ed and leaked instead of reused — RSS stays flat, but **any use of
+an arena array that escaped its scope faults deterministically at the guilty
+access**, with a clean backtrace naming the code holding the reference
+(instead of silent corruption, or a delayed crash hidden inside the
+unwinder). `arena_stats().quarantined` counts sealed chunks. Debug-only:
+address space grows for the length of the session.
+
 **Sizing the store**: the warm working set is (concurrent scopes) ×
 (per-scope peak allocation). If the cap is below it, chunks are trimmed to
 the GC at every scope exit and freshly allocated at every entry — arena

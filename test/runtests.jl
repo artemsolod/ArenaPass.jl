@@ -180,4 +180,23 @@ println("hugepage chunk path: OK (mmap alloc, reuse, eager unmap, ceiling fallba
 end
 println("near-typemax allocation request throws cleanly: OK")
 
+# --- 12. QUARANTINE debug mode: correct code runs normally; an escaped arena
+#          array faults deterministically at the guilty access (subprocess —
+#          the expected outcome IS a crash)
+qcode = """
+using ArenaPass
+ArenaPass.QUARANTINE[] = true
+work(N) = (tmp = zeros(N); tmp .= 2.0; sum(tmp))
+@assert (@arena work(100_000)) == 200_000.0     # clean code: unaffected
+@assert arena_stats().quarantined > 0           # chunks sealed, not reused
+leak(N) = (v = zeros(N); v .= 7.0; v)
+leaked = @arena leak(100_000)                   # contract violation
+print(leaked[1])                                # must FAULT, not print 7.0
+"""
+proj = dirname(Base.active_project())
+qres = run(pipeline(ignorestatus(`$(Base.julia_cmd()) --project=$proj --startup-file=no -e $qcode`);
+                    stdout=devnull, stderr=devnull))
+@assert !success(qres)   # the escaped access crashed the subprocess, as designed
+println("QUARANTINE mode: OK (clean code unaffected; escaped access faults)")
+
 println("\nall ArenaPass tests passed")
