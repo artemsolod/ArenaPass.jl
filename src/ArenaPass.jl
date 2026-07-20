@@ -57,6 +57,14 @@ const STORE_MAX_BYTES = Ref(1 << 32)   # rescaled per-machine in __init__
 const HUGEPAGES = Ref(false)           # default Sys.islinux(), set in __init__
 const HUGEPAGE_SIZE = 1 << 21          # 2 MiB
 const MADV_HUGEPAGE = Cint(14)         # linux uapi
+
+# mmap'd chunks are INVISIBLE to Julia's GC accounting (own=false wrap): the
+# GC feels no pressure from them, so dropped chunks can pile up un-finalized
+# (munmap only happens in a finalizer, finalizers only run at collections)
+# and RSS grows until the OS OOM-kills the process. Track bytes dropped but
+# not yet munmapped, and force a collection before mapping fresh memory when
+# too much is pending.
+const PENDING_MUNMAP = Threads.Atomic{Int}(0)
 # PROT_READ|PROT_WRITE; MAP_PRIVATE|MAP_ANONYMOUS (0x1000 = MAP_ANON on mac,
 # where the mmap path still works for testing — madvise is Linux-only)
 const MMAP_PROT = Cint(0x3)
@@ -64,6 +72,11 @@ const MMAP_FLAGS = Cint(Sys.islinux() ? 0x22 : 0x1002)
 
 function alloc_chunk(len::Int)::Memory{UInt8}
     if HUGEPAGES[]
+        # safety valve: with > max(cap/4, 1 GiB) dropped-but-unmapped, run the
+        # finalizers before mapping more — otherwise nothing ever pushes back
+        if PENDING_MUNMAP[] > max(STORE_MAX_BYTES[] >> 2, 1 << 30)
+            GC.gc()
+        end
         len = (len + HUGEPAGE_SIZE - 1) & ~(HUGEPAGE_SIZE - 1)
         ptr = @ccall mmap(C_NULL::Ptr{Cvoid}, len::Csize_t, MMAP_PROT::Cint,
                           MMAP_FLAGS::Cint, (-1)::Cint, 0::Int64)::Ptr{Cvoid}
@@ -72,6 +85,7 @@ function alloc_chunk(len::Int)::Memory{UInt8}
                 @ccall madvise(ptr::Ptr{Cvoid}, len::Csize_t, MADV_HUGEPAGE::Cint)::Cint
             m = unsafe_wrap(Memory{UInt8}, Ptr{UInt8}(ptr), len; own=false)
             finalizer(m) do mm
+                Threads.atomic_sub!(PENDING_MUNMAP, length(mm))
                 @ccall munmap(pointer(mm)::Ptr{Cvoid}, length(mm)::Csize_t)::Cint
             end
             return m
@@ -80,6 +94,13 @@ function alloc_chunk(len::Int)::Memory{UInt8}
     end
     return Memory{UInt8}(undef, len)
 end
+
+# Call at every site that DROPS a chunk (trim, stale-drop): from that moment
+# only its finalizer references the mapping. Approximation: when HUGEPAGES is
+# off (or for pre-toggle GC-backed chunks) the finalizer never decrements, so
+# the counter can only overcount — worst case a spurious GC, never an OOM.
+note_dropped_chunk(ch::Memory{UInt8}) =
+    (HUGEPAGES[] && Threads.atomic_add!(PENDING_MUNMAP, length(ch)); nothing)
 const MIN_BYTES = Ref(1024)
 
 # The store lock is taken by every chunk claim/return from every scope on
@@ -106,6 +127,7 @@ function take_chunk!(minsz::Int)::Memory{UInt8}
                 ch = pop!(CHUNK_STORE)
                 STORE_BYTES[] -= length(ch)
                 length(ch) >= minsz && return ch
+                note_dropped_chunk(ch)
             end
             nothing
         else
@@ -141,7 +163,9 @@ function return_chunks!(chunks::Vector{Memory{UInt8}})
             # is degenerating into GC traffic — raise STORE_MAX_BYTES.
             src = isempty(BIG_STORE) ? CHUNK_STORE : BIG_STORE
             isempty(src) && break
-            STORE_BYTES[] -= length(pop!(src))
+            ch = pop!(src)
+            STORE_BYTES[] -= length(ch)
+            note_dropped_chunk(ch)
             Threads.atomic_add!(CHUNKS_TRIMMED, 1)
         end
     end
@@ -153,7 +177,11 @@ function bump!(a::Arena, sz::Int)::Ptr{UInt8}
     if a.cur != 0
         chunk = a.chunks[a.cur]
         pos = (a.pos + 63) & ~63
-        if pos + sz <= length(chunk)
+        # sz <= length - pos, NOT pos + sz <= length: for sz near typemax the
+        # addition wraps negative, the check passes, and the caller writes far
+        # past the chunk — a segfault where OutOfMemoryError was due. The
+        # subtraction form cannot overflow (0 <= pos <= length).
+        if pos <= length(chunk) && sz <= length(chunk) - pos
             a.pos = pos + sz
             return pointer(chunk) + pos
         end
@@ -237,7 +265,7 @@ function arena_stats()
     store_bytes = lock(() -> STORE_BYTES[], STORE_LOCK)
     return (nallocs=NALLOCS[], fallbacks=FALLBACKS[],
             chunks_created=CHUNKS_CREATED[], chunks_trimmed=CHUNKS_TRIMMED[],
-            store_bytes=store_bytes)
+            store_bytes=store_bytes, pending_munmap=PENDING_MUNMAP[])
 end
 reset_arena_stats!() = (NALLOCS[] = 0; FALLBACKS[] = 0; CHUNKS_TRIMMED[] = 0; nothing)
 
@@ -610,8 +638,13 @@ function __init__()
     # cap starves high-thread machines into chunk churn, where every scope
     # exit trims chunks to the GC and every entry allocates fresh ones —
     # arena traffic becomes GC traffic (watch arena_stats().chunks_trimmed).
-    STORE_MAX_BYTES[] = max(1 << 32, Threads.nthreads() << 29)  # ≥4 GiB, 512 MiB/thread
+    # ...but never more than a quarter of physical RAM: the warm store is a
+    # cache, and on many-core machines nthreads×512MiB alone can reach OOM-kill
+    # territory once the workload's own data is accounted for
+    STORE_MAX_BYTES[] = min(max(1 << 32, Threads.nthreads() << 29),
+                            Int(Sys.total_memory() >> 2))
     HUGEPAGES[] = Sys.islinux()   # THP madvise is a no-op elsewhere
+    PENDING_MUNMAP[] = 0
     return nothing
 end
 

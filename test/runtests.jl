@@ -151,7 +151,27 @@ GC.gc(); GC.gc()                         # run munmap finalizers of dropped chun
 c1 = arena_stats().chunks_created
 @assert (@arena outer(1_000_000)) == outer(1_000_000)
 @assert arena_stats().chunks_created == c1
+# dropped mmap chunks are tracked and reclaimed (OOM safety valve accounting)
+ArenaPass.STORE_MAX_BYTES[] = 0          # every scope exit drops its chunks
+@arena outer(1_000_000)
+p0 = ArenaPass.PENDING_MUNMAP[]
+@assert p0 > 0                           # drop was counted as pending munmap
+GC.gc(); GC.gc()
+@assert ArenaPass.PENDING_MUNMAP[] < p0  # finalizers ran and unmapped
+ArenaPass.STORE_MAX_BYTES[] = old_cap
 ArenaPass.HUGEPAGES[] = old_hp
-println("hugepage chunk path: OK (mmap alloc, reuse, finalizer)")
+println("hugepage chunk path: OK (mmap alloc, reuse, finalizer, pending accounting)")
+
+# bump! overflow: a near-typemax size must error like native, not OOB-write
+@assert begin
+    threw = try
+        @arena zeros(typemax(Int) ÷ 8 - 100)
+        false
+    catch
+        true
+    end
+    threw
+end
+println("near-typemax allocation request throws cleanly: OK")
 
 println("\nall ArenaPass tests passed")
