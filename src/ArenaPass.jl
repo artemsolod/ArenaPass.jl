@@ -244,7 +244,17 @@ reset_arena_stats!() = (NALLOCS[] = 0; FALLBACKS[] = 0; CHUNKS_TRIMMED[] = 0; no
 # ---------------- the scoped method swap ----------------
 Base.Experimental.@MethodTable ARENA_TABLE
 
-Base.Experimental.@overlay ARENA_TABLE function (::Type{Memory{T}})(::UndefInitializer, m::Int) where {T}
+# @consistent_overlay, not @overlay: a plain overlay poisons the whole world's
+# effects (any call might reach the overlaid method), which disables concrete
+# evaluation / constant folding of pure calls — e.g. the kwarg-validation
+# machinery (Base.diff_names & co) that native compilation folds away then
+# runs (and allocates) on EVERY kwarg call in a loop. Declaring consistency is
+# sound here: only :consistent + :effect_free calls get folded, such calls
+# cannot expose the identity of a Memory they allocate (mutable allocation is
+# never :consistent), and a folded call makes no runtime allocations at all —
+# so folding via the original method loses no arena coverage and changes no
+# observable behavior.
+Base.Experimental.@consistent_overlay ARENA_TABLE function (::Type{Memory{T}})(::UndefInitializer, m::Int) where {T}
     if isbitstype(T) && sizeof(T) * m >= MIN_BYTES[]
         # deliberate dynamic call: dynamic dispatch resolves in the NATIVE cache,
         # so the allocator and everything it calls (Dict/TLS machinery) compiles
