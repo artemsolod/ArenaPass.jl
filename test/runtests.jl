@@ -134,39 +134,18 @@ mkvec(T, n) = Base.inferencebarrier(T)(undef, n)      # ctor in f-position
 @assert length(@arena mkvec(Vector{Int32}, 8)) == 8   # same erasure class
 println("Type-valued args at dynamic sites: OK")
 
-# --- 11. hugepage-backed chunks: mmap-path lifecycle (alloc, warm reuse,
-#          munmap finalizer). madvise(MADV_HUGEPAGE) only applies on Linux;
-#          the mmap machinery itself is exercised on every platform.
+# --- 11. store drain/regrow: cap 0 drops everything, chunks recycle after
+#          (also exercises the trim path with GC-backed chunks)
 old_cap = ArenaPass.STORE_MAX_BYTES[]
 ArenaPass.STORE_MAX_BYTES[] = 0          # drain: scope exits drop all chunks
 @arena outer(1_000_000)
+@assert arena_stats().store_bytes == 0
 ArenaPass.STORE_MAX_BYTES[] = old_cap
-old_hp = ArenaPass.HUGEPAGES[]
-ArenaPass.HUGEPAGES[] = true
-c0 = arena_stats().chunks_created
-@assert (@arena outer(1_000_000)) == outer(1_000_000)   # fresh mmap'd chunk
-@assert arena_stats().chunks_created > c0
-GC.gc(); GC.gc()                         # run munmap finalizers of dropped chunks
-@assert (@arena outer(1_000_000)) == outer(1_000_000)   # warm mmap chunk reused
+@assert (@arena outer(1_000_000)) == outer(1_000_000)   # fresh chunk
 c1 = arena_stats().chunks_created
-@assert (@arena outer(1_000_000)) == outer(1_000_000)
+@assert (@arena outer(1_000_000)) == outer(1_000_000)   # warm reuse
 @assert arena_stats().chunks_created == c1
-# dropped mmap chunks are unmapped EAGERLY — resident memory must track the
-# store cap without waiting for GC (OOM / libunwind-exhaustion defense)
-@assert ArenaPass.MMAP_LIVE[] > 0        # warm mmap chunks are accounted
-ArenaPass.STORE_MAX_BYTES[] = 0          # every scope exit drops its chunks
-@arena outer(1_000_000)
-@assert ArenaPass.MMAP_LIVE[] == 0       # everything unmapped, no GC needed
-ArenaPass.STORE_MAX_BYTES[] = old_cap
-
-# over the mmap ceiling, chunk allocation falls back to GC-backed memory
-old_ceiling = ArenaPass.MMAP_MAX_BYTES[]
-ArenaPass.MMAP_MAX_BYTES[] = 0
-@assert (@arena outer(1_000_000)) == outer(1_000_000)
-@assert ArenaPass.MMAP_LIVE[] == 0       # nothing was mmap'd under the ceiling
-ArenaPass.MMAP_MAX_BYTES[] = old_ceiling
-ArenaPass.HUGEPAGES[] = old_hp
-println("hugepage chunk path: OK (mmap alloc, reuse, eager unmap, ceiling fallback)")
+println("store drain/regrow: OK")
 
 # bump! overflow: a near-typemax size must error like native, not OOB-write
 @assert begin
@@ -179,24 +158,5 @@ println("hugepage chunk path: OK (mmap alloc, reuse, eager unmap, ceiling fallba
     threw
 end
 println("near-typemax allocation request throws cleanly: OK")
-
-# --- 12. QUARANTINE debug mode: correct code runs normally; an escaped arena
-#          array faults deterministically at the guilty access (subprocess —
-#          the expected outcome IS a crash)
-qcode = """
-using ArenaPass
-ArenaPass.QUARANTINE[] = true
-work(N) = (tmp = zeros(N); tmp .= 2.0; sum(tmp))
-@assert (@arena work(100_000)) == 200_000.0     # clean code: unaffected
-@assert arena_stats().quarantined > 0           # chunks sealed, not reused
-leak(N) = (v = zeros(N); v .= 7.0; v)
-leaked = @arena leak(100_000)                   # contract violation
-print(leaked[1])                                # must FAULT, not print 7.0
-"""
-proj = dirname(Base.active_project())
-qres = run(pipeline(ignorestatus(`$(Base.julia_cmd()) --project=$proj --startup-file=no -e $qcode`);
-                    stdout=devnull, stderr=devnull))
-@assert !success(qres)   # the escaped access crashed the subprocess, as designed
-println("QUARANTINE mode: OK (clean code unaffected; escaped access faults)")
 
 println("\nall ArenaPass tests passed")

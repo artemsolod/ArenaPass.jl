@@ -47,91 +47,18 @@ Arena() = Arena(Memory{UInt8}[], 0, 0, Memory{UInt8}[], ReentrantLock())
 const CHUNK_SIZE = Ref(1 << 23)        # 8 MiB uniform chunks
 const STORE_MAX_BYTES = Ref(1 << 32)   # rescaled per-machine in __init__
 
-# Explicit transparent-hugepage backing for chunks (julia#59858 does this for
-# large GC allocations, but only from 1.13). Chunks are ideal THP targets:
-# large, uniform, long-lived, sequentially bumped. We go one step further
-# than madvising a malloc'd buffer: chunks come from anonymous mmap (page
-# aligned by construction, length rounded to the 2 MiB hugepage boundary),
-# then MADV_HUGEPAGE. The region is wrapped back into Memory{UInt8} with a
-# munmap finalizer, so the store/trim/GC lifecycle is unchanged.
-const HUGEPAGES = Ref(false)           # default Sys.islinux(), set in __init__
-const HUGEPAGE_SIZE = 1 << 21          # 2 MiB
-const MADV_HUGEPAGE = Cint(14)         # linux uapi
+# NOTE on hugepages: 0.4.0–0.4.7 backed chunks with per-chunk anonymous mmap
+# + madvise(MADV_HUGEPAGE). REMOVED: one VMA per chunk (madvise also blocks
+# neighbor-merging) exhausted vm.max_map_count (default 65530) on a 90-thread
+# production server — mmap then fails on map COUNT regardless of free memory,
+# and libunwind's pool-expansion mmap failure sends it into a bounds-check-
+# free emergency allocator that SIGSEGVs (five identical cores; confirmed by
+# nmaps == 65532 at death with modest RSS). Chunks are plain GC-allocated
+# Memory again: accounted, collected, VMA-neutral. Hugepages return properly
+# with the region-allocator design: ONE large reservation carved into chunks
+# (a single VMA), or via julia#59858 upstream from 1.13.
+alloc_chunk(len::Int)::Memory{UInt8} = Memory{UInt8}(undef, len)
 
-# mmap'd chunks are INVISIBLE to Julia's GC accounting (own=false wrap): the
-# GC feels no pressure from them, so nothing ever pushes back on mapped
-# memory. This is not just an OOM-kill risk — exhausted address space/commit
-# makes libunwind's own pool-expansion mmap fail, and its no-bounds-check
-# emergency allocator then SIGSEGVs (observed: two identical core dumps from
-# a 90-thread production run). Three defenses, layered:
-#   1. drop_chunk! munmaps EAGERLY via finalize() — the store cap bounds real
-#      resident memory, not just wrapper counts;
-#   2. MMAP_LIVE tracks every mapped chunk byte; at the MMAP_MAX_BYTES ceiling
-#      one GC reclaims any stragglers dropped through non-eager paths, and if
-#      still over, fresh chunks fall back to GC allocation, which the
-#      collector CAN feel and push back on.
-const MMAP_LIVE = Threads.Atomic{Int}(0)
-const MMAP_MAX_BYTES = Ref(typemax(Int))   # set to RAM/2 in __init__
-const MMAP_GC_ARMED = Threads.Atomic{Int}(1)
-
-# QUARANTINE: debug mode for hunting scope-contract violations. Instead of
-# returning chunks to the store at scope exit (reuse = silent corruption;
-# eager munmap = a delayed fault in the unwinder's shadow), every released
-# chunk is mprotect'ed PROT_NONE and leaked (pages dropped via MADV_DONTNEED,
-# so RSS stays flat; only address space is consumed). Any use of an escaped
-# arena array then faults DETERMINISTICALLY at the guilty access with a clean
-# stack — the backtrace names the code holding the escaped reference.
-# Set BEFORE the first @arena (forces all chunks onto the mmap path).
-const QUARANTINE = Ref(false)
-const QUARANTINED = Memory{UInt8}[]        # keeps wrappers alive: never munmap
-const MADV_DONTNEED = Cint(4)              # same value on linux and mac
-# PROT_READ|PROT_WRITE; MAP_PRIVATE|MAP_ANONYMOUS (0x1000 = MAP_ANON on mac,
-# where the mmap path still works for testing — madvise is Linux-only)
-const MMAP_PROT = Cint(0x3)
-const MMAP_FLAGS = Cint(Sys.islinux() ? 0x22 : 0x1002)
-
-function alloc_chunk(len::Int)::Memory{UInt8}
-    if HUGEPAGES[] || QUARANTINE[]
-        hlen = (len + HUGEPAGE_SIZE - 1) & ~(HUGEPAGE_SIZE - 1)
-        if MMAP_LIVE[] + hlen > MMAP_MAX_BYTES[]
-            # one shot at reclaiming mappings dropped through non-eager paths
-            # (armed flag: no GC storm when the working set is legitimately
-            # at the ceiling — re-arms only after dipping back under)
-            Threads.atomic_xchg!(MMAP_GC_ARMED, 0) == 1 && GC.gc()
-        else
-            MMAP_GC_ARMED[] = 1
-        end
-        # quarantine bypasses the ceiling: mappings are deliberately leaked
-        # (RSS stays flat via MADV_DONTNEED) and a GC-backed fallback chunk
-        # could not be mprotect'ed
-        if QUARANTINE[] || MMAP_LIVE[] + hlen <= MMAP_MAX_BYTES[]
-            ptr = @ccall mmap(C_NULL::Ptr{Cvoid}, hlen::Csize_t, MMAP_PROT::Cint,
-                              MMAP_FLAGS::Cint, (-1)::Cint, 0::Int64)::Ptr{Cvoid}
-            if ptr != Ptr{Cvoid}(-1)
-                Sys.islinux() &&
-                    @ccall madvise(ptr::Ptr{Cvoid}, hlen::Csize_t, MADV_HUGEPAGE::Cint)::Cint
-                Threads.atomic_add!(MMAP_LIVE, hlen)
-                m = unsafe_wrap(Memory{UInt8}, Ptr{UInt8}(ptr), hlen; own=false)
-                finalizer(m) do mm
-                    Threads.atomic_sub!(MMAP_LIVE, length(mm))
-                    @ccall munmap(pointer(mm)::Ptr{Cvoid}, length(mm)::Csize_t)::Cint
-                end
-                return m
-            end
-        end
-        # over the mmap ceiling, or mmap failed: use GC allocation, which the
-        # collector accounts for and pushes back on
-    end
-    return Memory{UInt8}(undef, len)
-end
-
-# Call at every site that DROPS a chunk (trim, stale-drop). mmap-backed chunks
-# are unmapped EAGERLY — finalize() runs the munmap finalizer synchronously
-# (it takes no locks), so resident memory tracks the store cap instead of
-# waiting for a GC that feels no pressure from unaccounted mappings. Exactly
-# as safe as reuse: a dropped chunk is unreachable by contract. For GC-backed
-# chunks finalize is a no-op.
-drop_chunk!(ch::Memory{UInt8}) = (finalize(ch); nothing)
 const MIN_BYTES = Ref(1024)
 
 # The store lock is taken by every chunk claim/return from every scope on
@@ -158,7 +85,6 @@ function take_chunk!(minsz::Int)::Memory{UInt8}
                 ch = pop!(CHUNK_STORE)
                 STORE_BYTES[] -= length(ch)
                 length(ch) >= minsz && return ch
-                drop_chunk!(ch)
             end
             nothing
         else
@@ -181,20 +107,6 @@ end
 
 function return_chunks!(chunks::Vector{Memory{UInt8}})
     isempty(chunks) && return nothing
-    if QUARANTINE[]
-        lock(STORE_LOCK) do
-            for ch in chunks
-                # drop the pages (RSS), then seal the range: any later touch
-                # of an escaped array faults at the guilty instruction
-                @ccall madvise(pointer(ch)::Ptr{Cvoid}, length(ch)::Csize_t,
-                               MADV_DONTNEED::Cint)::Cint
-                @ccall mprotect(pointer(ch)::Ptr{Cvoid}, length(ch)::Csize_t, 0::Cint)::Cint
-                push!(QUARANTINED, ch)
-            end
-        end
-        empty!(chunks)
-        return nothing
-    end
     csz = CHUNK_SIZE[]
     lock(STORE_LOCK) do
         for ch in chunks
@@ -208,9 +120,7 @@ function return_chunks!(chunks::Vector{Memory{UInt8}})
             # is degenerating into GC traffic — raise STORE_MAX_BYTES.
             src = isempty(BIG_STORE) ? CHUNK_STORE : BIG_STORE
             isempty(src) && break
-            ch = pop!(src)
-            STORE_BYTES[] -= length(ch)
-            drop_chunk!(ch)
+            STORE_BYTES[] -= length(pop!(src))
             Threads.atomic_add!(CHUNKS_TRIMMED, 1)
         end
     end
@@ -308,11 +218,9 @@ end
 
 function arena_stats()
     store_bytes = lock(() -> STORE_BYTES[], STORE_LOCK)
-    nquarantined = lock(() -> length(QUARANTINED), STORE_LOCK)
     return (nallocs=NALLOCS[], fallbacks=FALLBACKS[],
             chunks_created=CHUNKS_CREATED[], chunks_trimmed=CHUNKS_TRIMMED[],
-            store_bytes=store_bytes, mmap_live=MMAP_LIVE[],
-            quarantined=nquarantined)
+            store_bytes=store_bytes)
 end
 reset_arena_stats!() = (NALLOCS[] = 0; FALLBACKS[] = 0; CHUNKS_TRIMMED[] = 0; nothing)
 
@@ -779,10 +687,6 @@ function __init__()
     # territory once the workload's own data is accounted for
     STORE_MAX_BYTES[] = min(max(1 << 32, Threads.nthreads() << 29),
                             Int(Sys.total_memory() >> 2))
-    HUGEPAGES[] = Sys.islinux()   # THP madvise is a no-op elsewhere
-    MMAP_MAX_BYTES[] = Int(Sys.total_memory() >> 1)   # mmap ceiling: half of RAM
-    MMAP_GC_ARMED[] = 1
-    QUARANTINE[] = false; empty!(QUARANTINED)
     COMPILE_SERVICE[] = nothing   # any serialized channel/task is dead
     return nothing
 end

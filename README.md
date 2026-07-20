@@ -147,18 +147,14 @@ before the first `@arena` call.
 | `ArenaPass.MIN_BYTES[]` | `1024` | smaller allocations use the GC |
 | `ArenaPass.CHUNK_SIZE[]` | `8 MiB` | uniform chunk size |
 | `ArenaPass.STORE_MAX_BYTES[]` | `max(4 GiB, 512 MiB × nthreads)` | warm-store cap; excess chunks go to GC |
-| `ArenaPass.HUGEPAGES[]` | `true` on Linux | back chunks with anonymous mmap + `madvise(MADV_HUGEPAGE)` (2 MiB-aligned; what [julia#59858](https://github.com/JuliaLang/julia/pull/59858) does for large GC allocations from 1.13) |
-| `ArenaPass.MMAP_MAX_BYTES[]` | RAM/2 | ceiling on total mmap'd chunk bytes (`arena_stats().mmap_live`); above it chunks fall back to GC allocation |
 | `ArenaPass.SERIAL_COMPILE[]` | `true` | serialize in-world compilation (cache hits stay concurrent) |
 
-**Hunting contract violations**: set `ArenaPass.QUARANTINE[] = true` (before
-the first `@arena`) and rerun the suspect workload. Released chunks are then
-mprotect'ed and leaked instead of reused — RSS stays flat, but **any use of
-an arena array that escaped its scope faults deterministically at the guilty
-access**, with a clean backtrace naming the code holding the reference
-(instead of silent corruption, or a delayed crash hidden inside the
-unwinder). `arena_stats().quarantined` counts sealed chunks. Debug-only:
-address space grows for the length of the session.
+Chunks are plain GC-allocated `Memory` buffers. (Per-chunk mmap-backed
+hugepages were tried and removed: one VMA per chunk exhausts
+`vm.max_map_count` on high-thread machines, which makes unrelated `mmap`
+calls fail and crashes libunwind's failure handling. Hugepage backing will
+return as a single large reservation carved into chunks, or upstream via
+[julia#59858](https://github.com/JuliaLang/julia/pull/59858) from 1.13.)
 
 **Sizing the store**: the warm working set is (concurrent scopes) ×
 (per-scope peak allocation). If the cap is below it, chunks are trimmed to
