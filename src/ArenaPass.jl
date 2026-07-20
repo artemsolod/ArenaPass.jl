@@ -583,14 +583,57 @@ end
 # cores (identical libunwind fault, rsp == rbp, unreadable caller). So every
 # compile runs on a dedicated Task with a large reserved stack (lazily
 # committed — the reserve costs address space, not RSS).
-const COMPILE_STACK = Ref(1 << 28)   # 256 MiB reserved for compile tasks
+const COMPILE_STACK = Ref(1 << 28)   # 256 MiB reserved for the compile task
 
-function typeinf_big_stack(mi::Core.MethodInstance)
-    t = Task(() -> typeinf(ArenaCacheOwner(), mi, Compiler.SOURCE_MODE_ABI),
-             COMPILE_STACK[])
-    t.sticky = false
-    schedule(t)
-    return fetch(t)   # failures propagate as TaskFailedException
+# ONE persistent service task, not a task per compile: a fresh 256 MiB-stack
+# task per compile would add a stack mapping each time — and cumulative VMA
+# count (vm.max_map_count, default 65530) is itself a crash suspect: when the
+# map table fills, mmap starts failing regardless of free memory, and
+# libunwind's pool-expansion mmap failure is exactly what precedes its
+# emergency-allocator fault. All in-world compiles funnel through this one
+# task (serializing them — matches SERIAL_COMPILE's posture either way).
+const COMPILE_SERVICE = Ref{Union{Channel{Tuple{Core.MethodInstance,UInt,Channel{Any}}},Nothing}}(nothing)
+const SERVICE_LOCK = ReentrantLock()
+
+function compile_service_channel()
+    ch = COMPILE_SERVICE[]
+    ch !== nothing && return ch
+    lock(SERVICE_LOCK) do
+        ch2 = COMPILE_SERVICE[]
+        ch2 !== nothing && return ch2
+        ch2 = Channel{Tuple{Core.MethodInstance,UInt,Channel{Any}}}(64)
+        t = Task(function ()
+                     for (mi, world, resp) in ch2
+                         # the service task's own world age is frozen at its
+                         # creation — compile in the REQUESTER's world or CIs
+                         # go stale the moment new methods are defined
+                         put!(resp, try
+                             (:ok, Base.invoke_in_world(world, typeinf, ArenaCacheOwner(),
+                                                        mi, Compiler.SOURCE_MODE_ABI))
+                         catch err
+                             (:err, err)
+                         end)
+                     end
+                 end, COMPILE_STACK[])
+        t.sticky = false
+        schedule(t)
+        COMPILE_SERVICE[] = ch2
+        return ch2
+    end
+end
+
+function typeinf_big_stack(mi::Core.MethodInstance, world::UInt)
+    if ccall(:jl_generating_output, Cint, ()) != 0
+        # precompiling: run on the root task (ample stack, tiny workload
+        # graphs) — a live service Task must never be reachable when the
+        # pkgimage is serialized ("Task cannot be serialized")
+        return typeinf(ArenaCacheOwner(), mi, Compiler.SOURCE_MODE_ABI)
+    end
+    resp = Channel{Any}(1)
+    put!(compile_service_channel(), (mi, world, resp))
+    tag, val = take!(resp)::Tuple{Symbol,Any}
+    tag === :ok && return val
+    throw(val)
 end
 
 function compile_ci(s::Int, @nospecialize(key), @nospecialize(f),
@@ -599,7 +642,7 @@ function compile_ci(s::Int, @nospecialize(key), @nospecialize(f),
                                     world::Csize_t)::Ptr{Cvoid}
     miptr == C_NULL && return nothing
     mi = unsafe_pointer_to_objref(miptr)::Core.MethodInstance
-    ci = typeinf_big_stack(mi)
+    ci = typeinf_big_stack(mi, world)
     ci isa CodeInstance || return nothing
     d = CI_DICTS[s]
     lock(() -> (d[key] = ci), CI_LOCKS[s])
@@ -740,6 +783,7 @@ function __init__()
     MMAP_MAX_BYTES[] = Int(Sys.total_memory() >> 1)   # mmap ceiling: half of RAM
     MMAP_GC_ARMED[] = 1
     QUARANTINE[] = false; empty!(QUARANTINED)
+    COMPILE_SERVICE[] = nothing   # any serialized channel/task is dead
     return nothing
 end
 
