@@ -509,6 +509,38 @@ const CI_NSHARDS = 64
 const CI_LOCKS = [ReentrantLock() for _ in 1:CI_NSHARDS]
 const CI_DICTS = [Dict{Any,CodeInstance}() for _ in 1:CI_NSHARDS]
 
+# In-world COMPILATION is serialized under one lock (cache hits stay sharded
+# and cheap — they outnumber compiles by orders of magnitude). Fully parallel
+# typeinf/codegen through an external AbstractInterpreter is off the beaten
+# path of the 1.12 runtime: with ~90 workers compiling a large unseen call
+# graph concurrently, two core dumps showed identical SIGSEGVs inside bundled
+# libunwind's free_object (dynamic unwind-info bookkeeping) on worker
+# threads — consistent with a JIT frame registration race that serial
+# compilation cannot hit. SERIAL_COMPILE[] = false restores the parallel
+# behavior for experiments / after an upstream fix.
+const SERIAL_COMPILE = Ref(true)
+const COMPILE_LOCK = ReentrantLock()
+
+function lookup_ci(s::Int, @nospecialize(key), world::UInt)
+    d = CI_DICTS[s]
+    ci = lock(() -> get(d, key, nothing), CI_LOCKS[s])
+    ci isa CodeInstance && ci.min_world <= world <= ci.max_world && return ci
+    return nothing
+end
+
+function compile_ci(s::Int, @nospecialize(key), @nospecialize(f),
+                    @nospecialize(args::Tuple), world::UInt)
+    miptr = @ccall jl_method_lookup(Any[f, args...]::Ptr{Any}, (1 + length(args))::Csize_t,
+                                    world::Csize_t)::Ptr{Cvoid}
+    miptr == C_NULL && return nothing
+    mi = unsafe_pointer_to_objref(miptr)::Core.MethodInstance
+    ci = typeinf(ArenaCacheOwner(), mi, Compiler.SOURCE_MODE_ABI)
+    ci isa CodeInstance || return nothing
+    d = CI_DICTS[s]
+    lock(() -> (d[key] = ci), CI_LOCKS[s])
+    return ci
+end
+
 function arena_codeinstance(@nospecialize(f), @nospecialize(args::Tuple))
     # Base.typesof builds Tuple{Core.Typeof(f), Core.Typeof.(args)...} in one
     # step; repeated calls intern to the SAME type object (cache-hit in the
@@ -521,20 +553,16 @@ function arena_codeinstance(@nospecialize(f), @nospecialize(args::Tuple))
     key = Base.typesof(f, args...)
     world = Base.tls_world_age()
     s = Int(objectid(key) % UInt(CI_NSHARDS)) + 1  # interned → objectid is stable
-    d = CI_DICTS[s]
-    lock(CI_LOCKS[s]) do
-        ci = get(d, key, nothing)
-        if ci isa CodeInstance && ci.min_world <= world <= ci.max_world
-            return ci
+    ci = lookup_ci(s, key, world)                  # sharded fast path, no compile
+    ci !== nothing && return ci
+    if SERIAL_COMPILE[]
+        lock(COMPILE_LOCK) do
+            # re-check: another thread may have compiled it while we waited
+            ci = lookup_ci(s, key, world)
+            ci !== nothing ? ci : compile_ci(s, key, f, args, world)
         end
-        miptr = @ccall jl_method_lookup(Any[f, args...]::Ptr{Any}, (1 + length(args))::Csize_t,
-                                        world::Csize_t)::Ptr{Cvoid}
-        miptr == C_NULL && return nothing
-        mi = unsafe_pointer_to_objref(miptr)::Core.MethodInstance
-        ci = typeinf(ArenaCacheOwner(), mi, Compiler.SOURCE_MODE_ABI)
-        ci isa CodeInstance || return nothing
-        d[key] = ci
-        return ci
+    else
+        compile_ci(s, key, f, args, world)         # racy duplicates possible; benign
     end
 end
 
